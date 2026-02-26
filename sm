@@ -1,0 +1,54 @@
+#!/bin/bash
+#
+# Split-Flap Clock — Serial Monitor
+# Auto-detects ESP32 port, kills conflicting processes, opens monitor
+#
+
+BAUD=115200
+
+# ── Auto-detect ESP32 serial port ──
+find_port() {
+    local patterns=(
+        /dev/cu.usbserial-*
+        /dev/cu.wchusbserial-*
+        /dev/cu.SLAB_USBtoUART*
+        /dev/cu.usbmodem-*
+    )
+    for pattern in "${patterns[@]}"; do
+        for port in $pattern; do
+            [ -e "$port" ] && echo "$port" && return 0
+        done
+    done
+    return 1
+}
+
+# ── Free the port ──
+free_port() {
+    local port="$1"
+    local pids
+    pids=$(lsof -t "$port" 2>/dev/null)
+    if [ -n "$pids" ]; then
+        echo "Killing processes on $port: $pids"
+        echo "$pids" | xargs kill -9 2>/dev/null
+        sleep 1
+    fi
+}
+
+# ── Main ──
+PORT="${1:-$(find_port)}"
+
+if [ -z "$PORT" ]; then
+    echo "ERROR: No ESP32 found."
+    echo "Searched: /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART*"
+    echo "Usage: ./sm [port]"
+    exit 1
+fi
+
+free_port "$PORT"
+
+echo "Serial Monitor: $PORT @ ${BAUD} baud"
+echo ""
+echo "  TO EXIT: press Ctrl-A, then K, then Y"
+echo ""
+echo "---"
+exec screen "$PORT" "$BAUD"

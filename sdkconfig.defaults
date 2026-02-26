@@ -1,0 +1,5 @@
+# Split-Flap Clock — custom sdkconfig overrides
+# Motor task busy-waits with esp_rom_delay_us, starving IDLE0.
+# Disable IDLE task watchdog to suppress harmless warnings.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
