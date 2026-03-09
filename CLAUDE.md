@@ -4,73 +4,177 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Split-flap display controller firmware (project name: `split_flap_v11`) for **ESP32** using **ESP-IDF v5.4.1**. Drives 4 stepper motors with Hall-effect sensor feedback to display 4 digits (0-9) on physical split-flap drums. Currently on **v12** (production rewrite with safety features).
+Split-flap display controller firmware (project name: `split_flap_v11`) for **ESP32** using **ESP-IDF v5.4.1**. Drives 4 stepper motors (28BYJ-48 via ULN2003) with Hall-effect sensor feedback to display 4 digits (0-9) on physical split-flap drums. Each drum has 10 flaps and 10 magnets. Currently on **v12**.
 
-## Build & Flash Commands
+## Quick Start (for new developers)
 
-Requires ESP-IDF toolchain. Source the IDF environment first (`source $IDF_PATH/export.sh` or use the VS Code ESP-IDF extension).
+### Prerequisites
+- macOS with Homebrew (or Linux)
+- ESP32 board connected via USB
 
+### First Time (clone + run)
 ```bash
-idf.py build              # Build firmware
-idf.py flash              # Flash to ESP32 (default port)
-idf.py flash -p /dev/...  # Flash to specific serial port
-idf.py monitor            # Serial monitor at 115200 baud
-idf.py flash monitor      # Flash then immediately monitor
-idf.py menuconfig         # SDK configuration editor
-idf.py fullclean          # Clean build directory completely
+git clone <repo-url> "flip flap clock"
+cd "flip flap clock"
+./start              # Installs ESP-IDF, builds, flashes, opens monitor
 ```
 
-A Dev Container (`.devcontainer/`) is available with the `espressif/idf` Docker image for reproducible builds.
+`./start` automatically:
+1. Checks git, python3, cmake, screen are installed
+2. Installs ESP-IDF v5.4.1 if not present (~5 min first time)
+3. Detects ESP32 serial port
+4. Builds + flashes firmware (first time only)
+5. Opens serial monitor
+
+### Daily Development
+```bash
+./flash              # Build + auto-detect ESP32 + flash
+./start              # Open serial monitor (or re-setup if needed)
+```
+
+**Inside the serial monitor**, type commands (see reference below). Exit: `Ctrl+A` then `K`, then `Y`.
+
+### Other Scripts
+```bash
+./dev.sh             # Build + Flash + Monitor (all in one)
+./dev.sh build       # Build only
+./dev.sh mon         # Monitor only
+./open.sh            # Just open serial monitor (no build)
+```
+
+## Serial Commands Reference
+
+After flashing, open the serial monitor (115200 baud). Available commands:
+
+| Command | Example | What it does |
+|---------|---------|--------------|
+| **4 digits** | `1234` | Display those digits on the flaps |
+| **m**N | `m0` | Test 1 flap on motor N (0-3) |
+| **m**N count | `m2 3` | Test 3 flaps on motor N |
+| **s**N steps | `s0 200` | Raw step motor N by exact steps |
+| **all** steps | `all 4000` | Step all 4 motors simultaneously |
+| **spf**N val | `spf0 210` | Set steps-per-flap for motor N (saved) |
+| **speed** val | `speed 1500` | Set step delay in microseconds |
+| **cal** | `cal` | Recalibrate all drums using Hall sensors |
+| **st** | `st` | Show Hall sensor status for all drums |
+| **reset** | `reset` | Clear saved data and restart |
+
+### Verification Prompt
+After every digit command, the system asks **"Showing?"**. Type what the drums actually show (e.g., `0030`), and it will:
+- Report which drums are off and by how much
+- **Auto-correct SPF** for each drum based on the error
+- Update `cur[]` to actual position so next move is accurate
+- Save corrected values to flash (NVS)
+
+Press **Enter** to skip verification.
 
 ## Architecture
 
 Single-file firmware in `main/main.c`. Two FreeRTOS tasks communicate via a queue:
 
-- **`motor_task`** (priority 10) — Owns all stepper motor operations. Receives `cmd_t` messages from the queue. Handles calibration and digit movement. Registered with task watchdog.
-- **`input_task`** (priority 3) — Reads UART0 serial input, parses commands (`4 digits` or `cal`), posts `cmd_t` to the queue. Waits for calibration to complete before accepting input.
+- **`motor_task`** (priority 10) -- Owns all stepper motor operations. Receives `cmd_t` messages from the queue. Sets `motor_busy` flag while working.
+- **`input_task`** (priority 3) -- Reads UART0 serial input, parses commands, posts `cmd_t` to the queue. Waits for `motor_busy` to clear before accepting next command.
 
 ### Motor Control Flow
 
-1. **Calibration**: `clear_sensor()` -> rotate until Hall pulse -> stop on magnet (position = 0)
-2. **Move**: `clear_sensor()` (step past magnet from previous stop) -> count Hall pulses until target -> stop on target magnet
-3. **Ramp**: Trapezoidal speed profile — starts at `RAMP_START_US`, accelerates to `RUN_US` cruise, decelerates at end
+1. **On boot**: Load position + SPF from NVS flash. If no saved data, ask user what's currently showing.
+2. **Move**: Calculate flaps needed, multiply by SPF to get steps, execute with trapezoidal ramp profile.
+3. **Verify**: After each move, optionally verify actual position and auto-correct SPF.
+4. **Save**: Position and SPF saved to NVS after every move.
 
-### Safety Features (v12)
+### Key Data Structures
 
-- **Task watchdog** (TWDT) on motor_task with periodic feeding during long operations
-- **Stall detection**: aborts move if no Hall pulse for 2x expected step interval
-- **Auto-recalibrate**: after `MAX_CONSECUTIVE_ERRS` (2) failures per drum
-- **Motor idle timeout**: de-energizes coils after `MOTOR_IDLE_TIMEOUT_MS` (5s)
-- **Cooldown**: `COOLDOWN_MS` (200ms) gap between consecutive drum moves
-- `clear_sensor()` returns bool — hardware fault detection on sensor clear failure
+```c
+cmd_t {
+    int  digits[4];     // target digits (for display command)
+    bool recal;         // true = recalibrate all
+    bool manual_step;   // true = raw step command (s0 200)
+    bool all_step;      // true = step all motors (all 4000)
+    int  step_motor;    // which motor (0-3)
+    int  step_count;    // how many steps
+}
+```
 
-### Key Tuning Constants
+## GPIO Pin Mapping
 
-All in `main/main.c` top section. Currently set **slow for testing** — decrease `RUN_US` toward 1500 for production speed.
+```
+Motor 0 (M1):  IN1=GPIO18  IN2=GPIO19  IN3=GPIO21  IN4=GPIO22
+Motor 1 (M2):  IN1=GPIO23  IN2=GPIO25  IN3=GPIO26  IN4=GPIO27
+Motor 2 (M3):  IN1=GPIO32  IN2=GPIO33  IN3=GPIO4   IN4=GPIO5
+Motor 3 (M4):  IN1=GPIO12  IN2=GPIO13  IN3=GPIO14  IN4=GPIO15
 
-| Constant | Current (test) | Production | Purpose |
-|----------|---------------|------------|---------|
-| `RUN_US[4]` | 3000 | ~1500 | Cruise step delay (μs) |
-| `CAL_US[4]` | 4000 | ~3000 | Calibration step delay (μs) |
-| `RAMP_START_US` | 7000 | ~5000 | Initial ramp delay (μs) |
-| `RAMP_STEPS` | 100 | ~80 | Ramp length in steps |
-| `SPF[4]` | 339,339,324,313 | — | Steps per flap (measured) |
-| `DEBOUNCE_US` | 80000 | — | Hall debounce (80ms) |
-| `STEP_PAST` | 15 | — | Steps to clear magnet (< SPF/2) |
+Hall Sensors:   D0=GPIO34   D1=GPIO39   D2=GPIO36   D3=GPIO16
+```
 
-### GPIO Pin Mapping
+**Important GPIO notes:**
+- GPIOs 34, 36, 39 are **input-only** on ESP32 -- no internal pull-up. Need **external 10k pull-up to 3.3V**.
+- GPIO 16 has internal pull-up (configured in code).
+- GPIO 12 is a **strapping pin** -- must be LOW at boot or ESP32 won't start.
 
-- Motors: `MP[4][4]` — 4 motors x 4 stepper pins (ULN2003/28BYJ-48 style)
-- Hall sensors: `HP[4]` — GPIOs 5, 18, 17, 34 (active LOW with internal pull-up)
+## Tuning Constants
+
+All in `main/main.c` top section. SPF and RUN_US can be changed at runtime via serial commands.
+
+| Constant | Default | Range | Purpose |
+|----------|---------|-------|---------|
+| `RUN_US[4]` | 2000 | 1000-5000 | Cruise step delay in microseconds (lower = faster) |
+| `CAL_US[4]` | 3000 | 2000-5000 | Calibration speed (slower for reliability) |
+| `RAMP_START_US` | 5000 | -- | Initial ramp delay (slow start) |
+| `RAMP_STEPS` | 80 | -- | How many steps to ramp up/down |
+| `SPF[4]` | 204,204,224,204 | 50-500 | Steps per flap (CRITICAL -- must be measured per drum) |
+| `COOLDOWN_MS` | 50 | -- | Gap between consecutive drum moves |
+| `MOTOR_IDLE_TIMEOUT_MS` | 5000 | -- | De-energize motors after this idle time |
+
+### How to Tune SPF (most important calibration)
+
+1. Type `m0` -- motor 0 should move exactly 1 flap
+2. If it overshoots (moved 2 flaps): `spf0 100` (decrease SPF)
+3. If it undershoots (moved half a flap): `spf0 300` (increase SPF)
+4. Repeat `m0` until it lands exactly 1 flap
+5. Do the same for `m1`, `m2`, `m3`
+6. SPF values are auto-saved to flash
+
+Or use the auto-correct: type `1111`, then when asked "Showing?", type what you actually see. SPF adjusts automatically.
+
+### How to Tune Speed
+
+1. Type `speed 2000` (default)
+2. Try `speed 1500` -- if motors work, go faster
+3. Try `speed 1200` -- if motors skip/stall, go back to 1500
+4. Find the sweet spot per your hardware
+
+## NVS Storage
+
+Position (`cur[4]`) and SPF values are persisted in ESP32's NVS (Non-Volatile Storage) flash. Survives power cycles -- no need to re-enter position on every boot. Type `reset` to clear.
 
 ## Hardware Notes
 
-- Stepper sequence: two-phase full-step (max torque) — `SEQ[4][4]`
-- Hall sensors are active LOW — `hall_active()` checks `gpio_get_level() == 0`
-- If a motor rotates backward: swap IN1<->IN4 and IN2<->IN3 in the `MP` array
-- If digits land wrong: adjust that drum's `SPF` value (+/-20 per flap off)
-- Target: ESP32 (not S2/S3/C3). OpenOCD config uses `esp32_devkitj_v1.cfg`
+- **Stepper motors**: 28BYJ-48 driven by ULN2003 boards
+- **Step sequence**: Two-phase full-step (2 coils at a time for max torque)
+- **Motor direction**: Reversed in firmware (`step_idx + 3` instead of `+1`)
+- **Hall sensors**: Active LOW with magnets on drum. `hall_active()` = `gpio_get_level() == 0`
+- **If a motor rotates wrong way**: swap IN1<->IN4 and IN2<->IN3 in the `MP` array for that motor
+- **If digits land wrong**: use the auto-correct verification or manually adjust SPF
+- **Target MCU**: ESP32 (not S2/S3/C3)
 
 ## IDF Component Dependencies
 
-Defined in `main/CMakeLists.txt`: `esp_driver_gpio`, `esp_driver_uart`, `esp_timer`, `esp_system`. Note: `esp_task_wdt.h` is provided by `esp_system`, not a separate component.
+Defined in `main/CMakeLists.txt`: `esp_driver_gpio`, `esp_driver_uart`, `esp_timer`, `esp_system`, `nvs_flash`.
+
+## File Structure
+
+```
+flip flap clock/
+  main/
+    main.c              # All firmware code (single file)
+    CMakeLists.txt      # Component dependencies
+  start                 # First time setup + serial monitor (run this first)
+  flash                 # Build + auto-detect + flash ESP32
+  dev.sh                # Build + Flash + Monitor (all in one)
+  open.sh               # Open serial monitor only
+  build.sh              # Legacy build script
+  sdkconfig             # ESP-IDF configuration
+  sdkconfig.defaults    # Default config overrides
+  CMakeLists.txt        # Top-level project CMake
+  CLAUDE.md             # This file
+```

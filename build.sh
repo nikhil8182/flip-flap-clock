@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 #
 # Split-Flap Clock — Build & Flash
 # Auto-detects ESP32 serial port, fixes IDF Python env, builds and flashes

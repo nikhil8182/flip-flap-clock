@@ -29,6 +29,9 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_system.h"
 
 static const char *TAG = "splitflap";
 
@@ -45,20 +48,20 @@ static const char *TAG = "splitflap";
  * D1: measured gaps 218,203,192,203 → avg 204
  * D2/D3: not yet measured, estimate ~200
  */
-static const int SPF[N_DIGITS] = {
-    204,   /* D0 — measured */
-    204,   /* D1 — measured */
-    224,   /* D2 — estimated (was short by ~1 digit at 204) */
-    204,   /* D3 — estimate (Hall dead, uses manual cal) */
+static int SPF[N_DIGITS] = {
+    204,   /* D0 */
+    204,   /* D1 */
+    224,   /* D2 */
+    204,   /* D3 */
 };
 
-/* Step delays (microseconds) — SLOW for testing */
-static const uint32_t RUN_US[N_DIGITS] = { 3000, 3000, 3000, 3000 };
-static const uint32_t CAL_US[N_DIGITS] = { 4000, 4000, 4000, 4000 };
+/* Step delays (microseconds) */
+static uint32_t RUN_US[N_DIGITS] = { 2000, 2000, 2000, 2000 };
+static uint32_t CAL_US[N_DIGITS] = { 3000, 3000, 3000, 3000 };
 
 /* Ramp profile */
-#define RAMP_STEPS      60
-#define RAMP_START_US   6000
+#define RAMP_STEPS      80
+#define RAMP_START_US   5000
 
 /*
  * MIN_IDLE: minimum consecutive idle reads before a rising edge
@@ -71,7 +74,7 @@ static const uint32_t CAL_US[N_DIGITS] = { 4000, 4000, 4000, 4000 };
 #define MOVE_TIMEOUT_FACTOR     3       /* abort if >3x expected steps */
 #define CAL_MAX_STEPS_FACTOR    20      /* max SPF * factor for cal    */
 #define MAX_CONSECUTIVE_ERRS    2       /* auto-recal after N failures */
-#define COOLDOWN_MS             200     /* min gap between drum moves  */
+#define COOLDOWN_MS             50      /* min gap between drum moves  */
 #define MOTOR_IDLE_TIMEOUT_MS   5000    /* de-energize if idle         */
 
 /* ============================================================
@@ -102,13 +105,56 @@ static int      cur[N_DIGITS]        = {0};
 static bool     calibrated[N_DIGITS] = {false};
 static int      step_idx[N_DIGITS]   = {0};
 static int      err_count[N_DIGITS]  = {0};
-static volatile bool cal_done        = false;
+static volatile bool cal_done        = true;
+static volatile bool motor_busy      = false;
 
 static QueueHandle_t cmd_queue = NULL;
+
+/* ============================================================
+ * NVS — SAVE / LOAD POSITION & SPF
+ * ============================================================ */
+static void nvs_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("splitflap", NVS_READWRITE, &h) != ESP_OK) return;
+    for (int d = 0; d < N_DIGITS; d++) {
+        char key[8];
+        snprintf(key, sizeof(key), "cur%d", d);
+        nvs_set_i32(h, key, cur[d]);
+        snprintf(key, sizeof(key), "spf%d", d);
+        nvs_set_i32(h, key, SPF[d]);
+    }
+    nvs_set_u8(h, "valid", 1);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static bool nvs_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("splitflap", NVS_READONLY, &h) != ESP_OK) return false;
+    uint8_t valid = 0;
+    nvs_get_u8(h, "valid", &valid);
+    if (!valid) { nvs_close(h); return false; }
+    for (int d = 0; d < N_DIGITS; d++) {
+        char key[8];
+        int32_t val;
+        snprintf(key, sizeof(key), "cur%d", d);
+        if (nvs_get_i32(h, key, &val) == ESP_OK) cur[d] = val;
+        snprintf(key, sizeof(key), "spf%d", d);
+        if (nvs_get_i32(h, key, &val) == ESP_OK) SPF[d] = val;
+    }
+    nvs_close(h);
+    return true;
+}
 
 typedef struct {
     int  digits[N_DIGITS];
     bool recal;
+    bool manual_step;
+    bool all_step;
+    int  step_motor;
+    int  step_count;
 } cmd_t;
 
 /* ============================================================
@@ -128,7 +174,7 @@ static void motor_off_all(void)
 
 static void motor_step(int d, uint32_t delay_us)
 {
-    step_idx[d] = (step_idx[d] + 1) & 3;
+    step_idx[d] = (step_idx[d] + 3) & 3;  /* +3 = reverse direction */
     const uint8_t *s = SEQ[step_idx[d]];
     for (int p = 0; p < 4; p++)
         gpio_set_level(MP[d][p], s[p]);
@@ -286,6 +332,7 @@ static void display_digits(const int digits[N_DIGITS])
     }
 
     motor_off_all();
+    nvs_save();
 
     ESP_LOGI(TAG, ">>> Display done");
 }
@@ -295,18 +342,37 @@ static void display_digits(const int digits[N_DIGITS])
  * ============================================================ */
 static void motor_task(void *pv)
 {
-    calibrate_all();
-
     cmd_t cmd;
     while (1) {
         if (xQueueReceive(cmd_queue, &cmd,
                           pdMS_TO_TICKS(MOTOR_IDLE_TIMEOUT_MS)) == pdTRUE) {
+            motor_busy = true;
             if (cmd.recal)
                 calibrate_all();
-            else
+            else if (cmd.all_step) {
+                int steps = cmd.step_count;
+                ESP_LOGI(TAG, "All motors: %d steps", steps);
+                for (int s = 0; s < steps; s++) {
+                    for (int d = 0; d < N_DIGITS; d++)
+                        motor_step(d, RUN_US[d] / N_DIGITS);
+                    if (s % 200 == 0 && s > 0) vTaskDelay(1);
+                }
+                motor_off_all();
+                ESP_LOGI(TAG, "All motors done");
+            } else if (cmd.manual_step) {
+                int d = cmd.step_motor;
+                int steps = cmd.step_count;
+                ESP_LOGI(TAG, "[D%d] Manual %d steps", d, steps);
+                for (int s = 0; s < steps; s++) {
+                    motor_step(d, RUN_US[d]);
+                    if (s % 200 == 0 && s > 0) vTaskDelay(1);
+                }
+                motor_off(d);
+                ESP_LOGI(TAG, "[D%d] Manual done", d);
+            } else
                 display_digits(cmd.digits);
-
             motor_off_all();
+            motor_busy = false;
         } else {
             motor_off_all();
         }
@@ -357,22 +423,24 @@ static void input_task(void *pv)
     uart_param_config(UART_NUM_0, &uart_cfg);
     uart_driver_install(UART_NUM_0, 512, 0, 0, NULL, 0);
 
-    while (!cal_done) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    vTaskDelay(pdMS_TO_TICKS(500));  /* let boot logs flush */
 
-    /* ---- Initial setup: ask what's currently showing ---- */
-    {
+    /* ---- Initial setup: load from NVS or ask user ---- */
+    if (nvs_load()) {
+        for (int d = 0; d < N_DIGITS; d++)
+            calibrated[d] = true;
+        printf("\r\nLoaded position: [");
+        for (int d = 0; d < N_DIGITS; d++) printf(" %d", cur[d]);
+        printf(" ]  SPF: [");
+        for (int d = 0; d < N_DIGITS; d++) printf(" %d", SPF[d]);
+        printf(" ]\r\nReady!\r\n");
+    } else {
         printf("\r\n+-----------------------------------+\r\n");
-        printf("|  INITIAL SETUP                    |\r\n");
-        printf("|  Look at the drums and type the   |\r\n");
-        printf("|  %d digits currently showing.      |\r\n", N_DIGITS);
-        printf("|  Then they will reset to %s.    |\r\n",
-               N_DIGITS == 2 ? "00" : "0000");
+        printf("|  What number is showing now?      |\r\n");
+        printf("|  Type %d digits + Enter            |\r\n", N_DIGITS);
         printf("+-----------------------------------+\r\n> ");
         fflush(stdout);
 
-        /* Read initial position from user */
         char ibuf[16];
         int ipos = 0;
         while (ipos < (int)sizeof(ibuf) - 1) {
@@ -395,33 +463,16 @@ static void input_task(void *pv)
         ibuf[ipos] = '\0';
 
         if (ipos == N_DIGITS) {
-            /* Set current position from user input — this also
-             * marks ALL drums as calibrated so move_to() won't
-             * try Hall-based calibration (D3 Hall is dead). */
             for (int d = 0; d < N_DIGITS; d++) {
                 cur[d] = ibuf[d] - '0';
                 calibrated[d] = true;
             }
-
+            nvs_save();
             printf("Set current = [");
             for (int d = 0; d < N_DIGITS; d++) printf(" %d", cur[d]);
-            printf(" ] — moving to zero...\r\n");
-
-            /* Send command to move to all zeros */
-            cmd_t cmd = { .recal = false };
-            for (int d = 0; d < N_DIGITS; d++)
-                cmd.digits[d] = 0;
-            xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
-
-            /* Wait for move to finish */
-            vTaskDelay(pdMS_TO_TICKS(500));
-            while (uxQueueMessagesWaiting(cmd_queue) > 0)
-                vTaskDelay(pdMS_TO_TICKS(100));
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            printf("Ready!\r\n");
+            printf(" ]\r\nReady!\r\n");
         } else {
-            printf("Skipped setup (expected %d digits, got %d)\r\n", N_DIGITS, ipos);
+            printf("Skipped (expected %d digits, got %d)\r\n", N_DIGITS, ipos);
         }
     }
 
@@ -433,9 +484,14 @@ static void input_task(void *pv)
         printf(" ]");
         for (int d = 0; d < 18 - N_DIGITS * 2; d++) printf(" ");
         printf("|\r\n");
-        printf("| Enter %d digits + Enter    |\r\n", N_DIGITS);
-        printf("| 'cal' = recalibrate       |\r\n");
-        printf("| 'st'  = sensor status     |\r\n");
+        printf("| %d digits = display        |\r\n", N_DIGITS);
+        printf("| m0 = test 1 flap motor 0  |\r\n");
+        printf("| m0 3 = test 3 flaps       |\r\n");
+        printf("| spf0 210 = set SPF        |\r\n");
+        printf("| speed 1500 = set speed    |\r\n");
+        printf("| s0 200 = raw steps        |\r\n");
+        printf("| all 4000 = all motors     |\r\n");
+        printf("| cal / st                  |\r\n");
         printf("+---------------------------+\r\n> ");
         fflush(stdout);
 
@@ -487,6 +543,88 @@ static void input_task(void *pv)
             continue;
         }
 
+        /* 'all 4000' = step all motors by 4000 steps */
+        if (strncasecmp(buf, "all", 3) == 0) {
+            int steps = atoi(buf + 3);
+            if (steps <= 0) steps = 1;
+            if (steps > 10000) steps = 10000;
+            printf("All motors: %d steps...\r\n", steps);
+            cmd_t cmd = { .all_step = true, .step_count = steps };
+            xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+            while (motor_busy)
+                vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* 'm0' = test 1 flap on motor 0 */
+        if ((buf[0] == 'm' || buf[0] == 'M') && buf[1] >= '0' && buf[1] <= '3' &&
+            (buf[2] == '\0' || buf[2] == ' ')) {
+            int motor = buf[1] - '0';
+            int flaps = atoi(buf + 2);
+            if (flaps <= 0) flaps = 1;
+            if (flaps > 10) flaps = 10;
+            int steps = flaps * SPF[motor];
+            printf("M%d: %d flap(s) = %d steps (SPF=%d)\r\n", motor, flaps, steps, SPF[motor]);
+            cmd_t cmd = { .manual_step = true, .step_motor = motor, .step_count = steps };
+            xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+            while (motor_busy)
+                vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* 'spf0 210' = set SPF for motor 0 to 210 */
+        if (strncasecmp(buf, "spf", 3) == 0 && buf[3] >= '0' && buf[3] <= '3') {
+            int motor = buf[3] - '0';
+            int val = atoi(buf + 4);
+            if (val > 50 && val < 500) {
+                SPF[motor] = val;
+                nvs_save();
+                printf("SPF[%d] = %d (saved)\r\n", motor, val);
+            } else {
+                printf("SPF must be 50-500 (got %d)\r\n", val);
+            }
+            continue;
+        }
+
+        /* 'speed 1500' = set RUN_US for all motors */
+        if (strncasecmp(buf, "speed", 5) == 0) {
+            int val = atoi(buf + 5);
+            if (val >= 1000 && val <= 5000) {
+                for (int d = 0; d < N_DIGITS; d++) RUN_US[d] = val;
+                printf("RUN_US = %d for all motors\r\n", val);
+            } else {
+                printf("Speed must be 1000-5000 us (got %d)\r\n", val);
+            }
+            continue;
+        }
+
+        /* 's0 200' = manual step motor 0 by 200 steps */
+        if ((buf[0] == 's' || buf[0] == 'S') && buf[1] >= '0' && buf[1] <= '3') {
+            int motor = buf[1] - '0';
+            int steps = atoi(buf + 2);
+            if (steps <= 0) steps = 1;
+            if (steps > 5000) steps = 5000;
+            printf("Stepping M%d by %d steps...\r\n", motor, steps);
+            cmd_t cmd = { .manual_step = true, .step_motor = motor, .step_count = steps };
+            xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+            while (motor_busy)
+                vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* 'reset' = clear NVS, re-ask position */
+        if (strcasecmp(input, "reset") == 0) {
+            nvs_handle_t h;
+            if (nvs_open("splitflap", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_erase_all(h);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            printf("NVS cleared. Restarting...\r\n");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+
         /* 'cal' */
         if (strcasecmp(input, "cal") == 0) {
             cmd_t cmd = { .recal = true };
@@ -516,55 +654,89 @@ static void input_task(void *pv)
         }
         if (!valid) continue;
 
-        xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        while (uxQueueMessagesWaiting(cmd_queue) > 0)
-            vTaskDelay(pdMS_TO_TICKS(100));
-        vTaskDelay(pdMS_TO_TICKS(500));
+        /* Save pre-move positions */
+        int before[N_DIGITS];
+        for (int d = 0; d < N_DIGITS; d++) before[d] = cur[d];
 
-        /* Ask user what's actually showing */
-        printf("\r\n--- What is ACTUALLY showing? Type %d digits: ", N_DIGITS);
+        xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+        while (motor_busy)
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+        /* --- Verification: what's actually showing? --- */
+        printf("\r\nShowing? (Enter to skip): ");
         fflush(stdout);
 
-        char fbuf[16];
-        int fpos = 0;
-        while (fpos < (int)sizeof(fbuf) - 1) {
-            uint8_t fch;
-            if (uart_read_bytes(UART_NUM_0, &fch, 1, portMAX_DELAY) <= 0)
+        char vbuf[16];
+        int vpos = 0;
+        while (vpos < (int)sizeof(vbuf) - 1) {
+            uint8_t vch;
+            if (uart_read_bytes(UART_NUM_0, &vch, 1, portMAX_DELAY) <= 0)
                 continue;
-            if (fch == '\n' || fch == '\r') {
+            if (vch == '\n' || vch == '\r') {
                 uart_write_bytes(UART_NUM_0, "\r\n", 2);
                 break;
             }
-            if (fch == 127 || fch == '\b') {
-                if (fpos > 0) { fpos--; uart_write_bytes(UART_NUM_0, "\b \b", 3); }
+            if (vch == 127 || vch == '\b') {
+                if (vpos > 0) { vpos--; uart_write_bytes(UART_NUM_0, "\b \b", 3); }
                 continue;
             }
-            if (fch >= '0' && fch <= '9') {
-                uart_write_bytes(UART_NUM_0, (char *)&fch, 1);
-                fbuf[fpos++] = (char)fch;
+            if (vch >= '0' && vch <= '9') {
+                uart_write_bytes(UART_NUM_0, (char *)&vch, 1);
+                vbuf[vpos++] = (char)vch;
             }
         }
-        fbuf[fpos] = '\0';
+        vbuf[vpos] = '\0';
 
-        if (fpos == N_DIGITS) {
-            printf("  Expected: [");
-            for (int i = 0; i < N_DIGITS; i++) printf(" %d", cmd.digits[i]);
-            printf(" ]  Actual: [");
-            for (int i = 0; i < N_DIGITS; i++) printf(" %c", fbuf[i]);
-            printf(" ]  ");
-            bool match = true;
-            for (int i = 0; i < N_DIGITS; i++) {
-                int exp = cmd.digits[i];
-                int act = fbuf[i] - '0';
-                int diff = (act - exp + N_FLAPS) % N_FLAPS;
-                if (diff != 0) {
-                    printf("D%d: off by +%d  ", i, diff);
-                    match = false;
+        if (vpos == N_DIGITS) {
+            bool perfect = true;
+            for (int d = 0; d < N_DIGITS; d++) {
+                int expected = cmd.digits[d];
+                int actual   = vbuf[d] - '0';
+                int flaps_intended = (expected - before[d] + N_FLAPS) % N_FLAPS;
+
+                if (actual == expected) {
+                    printf("  D%d: OK\r\n", d);
+                    continue;
                 }
+                perfect = false;
+
+                int off = (actual - expected + N_FLAPS) % N_FLAPS;
+                if (off > N_FLAPS / 2) off -= N_FLAPS;
+                /* actual flaps = intended + overshoot (handles wrap-around) */
+                int flaps_actual = flaps_intended + off;
+
+                printf("  D%d: wanted %d got %d (off %+d, moved %d/%d flaps)",
+                       d, expected, actual, off, flaps_actual, flaps_intended);
+
+                /* Auto-correct SPF if we moved enough flaps for reliable calc */
+                if (flaps_intended >= 2 && flaps_actual >= 2) {
+                    int old_spf = SPF[d];
+                    int new_spf = (flaps_intended * old_spf) / flaps_actual;
+                    if (new_spf < 150) new_spf = 150;  /* floor */
+                    if (new_spf > 400) new_spf = 400;  /* ceiling */
+                    if (new_spf != old_spf) {
+                        SPF[d] = new_spf;
+                        printf(" -> SPF %d=>%d", old_spf, new_spf);
+                    }
+                } else {
+                    printf(" (skip auto-correct: too few flaps)");
+                }
+                printf("\r\n");
+
+                /* Update cur to actual so next move is correct */
+                cur[d] = actual;
             }
-            if (match) printf("PERFECT!");
-            printf("\r\n");
+
+            if (perfect) {
+                printf("  PERFECT!\r\n");
+            } else {
+                nvs_save();
+                printf("  SPF updated & saved. cur=[");
+                for (int d = 0; d < N_DIGITS; d++) printf(" %d", cur[d]);
+                printf(" ] SPF=[");
+                for (int d = 0; d < N_DIGITS; d++) printf(" %d", SPF[d]);
+                printf(" ]\r\n");
+            }
         }
     }
 }
@@ -575,6 +747,12 @@ static void input_task(void *pv)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Split-Flap Display v12 starting");
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
 
     gpio_init_all();
     motor_off_all();

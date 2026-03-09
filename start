@@ -1,0 +1,123 @@
+#\!/bin/zsh
+#
+# Split-Flap Clock - First Time Setup + Serial Monitor
+# Clone the repo, plug in ESP32, run ./start
+#
+
+set -e
+
+IDF_VERSION="v5.4.1"
+IDF_PATH="$HOME/esp/esp-idf-$IDF_VERSION"
+BAUD=115200
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---- Colors ----
+RED="\033[0;31m"
+GRN="\033[0;32m"
+YEL="\033[0;33m"
+NC="\033[0m"
+
+log()  { echo "${GRN}[OK]${NC} $1" }
+warn() { echo "${YEL}[\!\!]${NC} $1" }
+fail() { echo "${RED}[ERR]${NC} $1"; exit 1 }
+
+# ---- Find ESP32 serial port ----
+find_port() {
+    for port in /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem-*; do
+        [ -e "$port" ] && echo "$port" && return 0
+    done
+    # Linux
+    for port in /dev/ttyUSB* /dev/ttyACM*; do
+        [ -e "$port" ] && echo "$port" && return 0
+    done
+    return 1
+}
+
+free_port() {
+    local pids=$(lsof -t "$1" 2>/dev/null)
+    [ -n "$pids" ] && warn "Freeing $1..." && echo "$pids" | xargs kill -9 2>/dev/null && sleep 1
+}
+
+echo ""
+echo "========================================"
+echo "  Split-Flap Clock - Setup & Monitor"
+echo "========================================"
+echo ""
+
+# ---- Step 1: Check dependencies ----
+echo "--- Checking dependencies ---"
+
+# git
+command -v git &>/dev/null || fail "git not found. Install: brew install git"
+log "git"
+
+# python3
+command -v python3 &>/dev/null || fail "python3 not found. Install: brew install python3"
+log "python3"
+
+# cmake
+command -v cmake &>/dev/null || { warn "cmake not found, installing..."; brew install cmake; }
+log "cmake"
+
+# screen
+command -v screen &>/dev/null || { warn "screen not found, installing..."; brew install screen; }
+log "screen"
+
+echo ""
+
+# ---- Step 2: Install ESP-IDF if needed ----
+echo "--- Checking ESP-IDF $IDF_VERSION ---"
+
+if [ -f "$IDF_PATH/export.sh" ]; then
+    log "ESP-IDF found at $IDF_PATH"
+else
+    warn "ESP-IDF not found. Installing (this takes a few minutes)..."
+    mkdir -p "$HOME/esp"
+    cd "$HOME/esp"
+    git clone -b "$IDF_VERSION" --recursive https://github.com/espressif/esp-idf.git "esp-idf-$IDF_VERSION"
+    cd "esp-idf-$IDF_VERSION"
+    ./install.sh esp32
+    log "ESP-IDF installed"
+fi
+
+echo ""
+
+# ---- Step 3: Check ESP32 connected ----
+echo "--- Checking ESP32 ---"
+
+PORT=$(find_port)
+if [ -z "$PORT" ]; then
+    warn "No ESP32 detected."
+    echo "  Plug in your ESP32 and run ./start again."
+    echo "  Searched: /dev/cu.usbserial-* /dev/ttyUSB*"
+    exit 0
+fi
+log "ESP32 found at $PORT"
+
+echo ""
+
+# ---- Step 4: Build if no firmware yet ----
+if [ \! -f "$PROJECT_DIR/build/split_flap_v11.bin" ]; then
+    echo "--- Building firmware (first time) ---"
+    source "$IDF_PATH/export.sh" 2>/dev/null
+    cd "$PROJECT_DIR"
+    idf.py build 2>&1 | tail -3
+    log "Build complete"
+    echo ""
+
+    echo "--- Flashing to $PORT ---"
+    free_port "$PORT"
+    idf.py flash -p "$PORT" 2>&1 | tail -5
+    log "Flash complete"
+    echo ""
+fi
+
+# ---- Step 5: Open serial monitor ----
+echo "--- Opening serial monitor ---"
+echo "  Port: $PORT"
+echo "  Baud: $BAUD"
+echo "  Exit: Ctrl+A then K, then Y"
+echo ""
+
+free_port "$PORT"
+screen "$PORT" "$BAUD"

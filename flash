@@ -1,0 +1,66 @@
+#\!/bin/zsh
+#
+# Split-Flap Clock - Build & Flash
+# Detects ESP32, builds firmware, flashes it
+#
+
+set -e
+
+IDF_VERSION="v5.4.1"
+IDF_PATH="$HOME/esp/esp-idf-$IDF_VERSION"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+RED="\033[0;31m"
+GRN="\033[0;32m"
+YEL="\033[0;33m"
+NC="\033[0m"
+
+log()  { echo "${GRN}[OK]${NC} $1" }
+warn() { echo "${YEL}[\!\!]${NC} $1" }
+fail() { echo "${RED}[ERR]${NC} $1"; exit 1 }
+
+find_port() {
+    for port in /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem-*; do
+        [ -e "$port" ] && echo "$port" && return 0
+    done
+    for port in /dev/ttyUSB* /dev/ttyACM*; do
+        [ -e "$port" ] && echo "$port" && return 0
+    done
+    return 1
+}
+
+free_port() {
+    local pids=$(lsof -t "$1" 2>/dev/null)
+    [ -n "$pids" ] && warn "Freeing $1..." && echo "$pids" | xargs kill -9 2>/dev/null && sleep 1
+}
+
+# ---- Check ESP-IDF ----
+if [ \! -f "$IDF_PATH/export.sh" ]; then
+    fail "ESP-IDF not found. Run ./start first to install."
+fi
+
+source "$IDF_PATH/export.sh" 2>/dev/null
+cd "$PROJECT_DIR"
+
+# ---- Build ----
+echo ""
+echo "=== Building ===" 
+idf.py build 2>&1 | tail -5
+log "Build complete"
+
+# ---- Flash ----
+PORT=$(find_port)
+if [ -z "$PORT" ]; then
+    warn "No ESP32 detected. Build OK, flash skipped."
+    echo "  Plug in ESP32 and run ./flash again."
+    exit 0
+fi
+
+free_port "$PORT"
+echo ""
+echo "=== Flashing $PORT ==="
+idf.py flash -p "$PORT" 2>&1 | tail -8
+log "Flash complete"
+
+echo ""
+echo "Run ./start to open serial monitor"
