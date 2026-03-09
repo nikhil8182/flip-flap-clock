@@ -1,4 +1,4 @@
-#\!/bin/bash
+#!/bin/bash
 #
 # Split-Flap Clock - Build & Flash
 # Works on macOS, Linux, and WSL
@@ -9,36 +9,37 @@ set -e
 IDF_VERSION="v5.4.1"
 IDF_PATH="$HOME/esp/esp-idf-$IDF_VERSION"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_NAME="split_flap_v11.bin"
+BIN_PATH="$PROJECT_DIR/build/$BIN_NAME"
+FLASH_MARKER="$PROJECT_DIR/build/.last_flash"
 
-RED="\033[0;31m"
-GRN="\033[0;32m"
-YEL="\033[0;33m"
-NC="\033[0m"
+log()  { printf '\033[32m[OK]\033[0m %s\n' "$1"; }
+warn() { printf '\033[33m[!!]\033[0m %s\n' "$1"; }
+fail() { printf '\033[31m[ERR]\033[0m %s\n' "$1"; exit 1; }
 
-log()  { echo -e "${GRN}[OK]${NC} $1"; }
-warn() { echo -e "${YEL}[\!\!]${NC} $1"; }
-fail() { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
+is_mac() { [ "$(uname)" = "Darwin" ]; }
+
+file_hash() {
+    if is_mac; then
+        md5 -q "$1" 2>/dev/null
+    else
+        md5sum "$1" 2>/dev/null | cut -d' ' -f1
+    fi
+}
 
 find_port() {
-    local patterns=(
-        /dev/cu.usbserial-*
-        /dev/cu.wchusbserial-*
-        /dev/cu.SLAB_USBtoUART*
-        /dev/cu.usbmodem-*
-        /dev/ttyUSB*
-        /dev/ttyACM*
-    )
-    for pattern in "${patterns[@]}"; do
-        for port in $pattern; do
-            [ -e "$port" ] && echo "$port" && return 0
-        done
+    for port in /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem-* /dev/ttyUSB* /dev/ttyACM*; do
+        [ -e "$port" ] && echo "$port" && return 0
     done
     return 1
 }
 
 free_port() {
     local pids
-    pids=$(lsof -t "$1" 2>/dev/null || fuser "$1" 2>/dev/null | tr -s \" \" \"\n\" || true)
+    pids=$(lsof -t "$1" 2>/dev/null || true)
+    if [ -z "$pids" ]; then
+        pids=$(fuser "$1" 2>/dev/null | tr -s ' ' '\n' || true)
+    fi
     if [ -n "$pids" ]; then
         warn "Freeing $1..."
         echo "$pids" | xargs kill -9 2>/dev/null || true
@@ -47,17 +48,17 @@ free_port() {
 }
 
 # ---- Check ESP-IDF ----
-if [ \! -f "$IDF_PATH/export.sh" ]; then
+if [ ! -f "$IDF_PATH/export.sh" ]; then
     fail "ESP-IDF not found. Run ./start first to install everything."
 fi
 
 export IDF_PATH
-source "$IDF_PATH/export.sh" 2>/dev/null || true
+. "$IDF_PATH/export.sh" 2>/dev/null || true
 cd "$PROJECT_DIR"
 
 # ---- Build ----
 echo ""
-echo "=== Building ===" 
+echo "=== Building ==="
 idf.py build 2>&1 | tail -5
 log "Build complete"
 
@@ -69,11 +70,34 @@ if [ -z "$PORT" ]; then
     exit 0
 fi
 
-free_port "$PORT"
-echo ""
-echo "=== Flashing $PORT ==="
-idf.py flash -p "$PORT" 2>&1 | tail -8
-log "Flash complete"
+# Check if flash is actually needed
+CURRENT_HASH=$(file_hash "$BIN_PATH")
+SKIP_FLASH=false
+if [ -f "$FLASH_MARKER" ]; then
+    LAST_HASH=$(cat "$FLASH_MARKER")
+    if [ "$CURRENT_HASH" = "$LAST_HASH" ]; then
+        SKIP_FLASH=true
+    fi
+fi
+
+if [ "$SKIP_FLASH" = true ]; then
+    log "Firmware unchanged — already flashed"
+    echo "  Use ./flash --force to reflash anyway"
+    # Allow --force to override
+    if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
+        SKIP_FLASH=false
+        warn "Force reflash requested"
+    fi
+fi
+
+if [ "$SKIP_FLASH" = false ]; then
+    free_port "$PORT"
+    echo ""
+    echo "=== Flashing $PORT ==="
+    idf.py flash -p "$PORT" 2>&1 | tail -8
+    echo "$CURRENT_HASH" > "$FLASH_MARKER"
+    log "Flash complete"
+fi
 
 echo ""
 echo "Run ./start to open serial monitor"

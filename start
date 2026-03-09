@@ -11,10 +11,14 @@ IDF_VERSION="v5.4.1"
 IDF_PATH="$HOME/esp/esp-idf-$IDF_VERSION"
 BAUD=115200
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_NAME="split_flap_v11.bin"
+BIN_PATH="$PROJECT_DIR/build/$BIN_NAME"
+FLASH_MARKER="$PROJECT_DIR/build/.last_flash"
 
 log()  { printf '\033[32m[OK]\033[0m %s\n' "$1"; }
 warn() { printf '\033[33m[!!]\033[0m %s\n' "$1"; }
 fail() { printf '\033[31m[ERR]\033[0m %s\n' "$1"; exit 1; }
+info() { printf '\033[36m[--]\033[0m %s\n' "$1"; }
 
 is_mac() { [ "$(uname)" = "Darwin" ]; }
 
@@ -44,6 +48,15 @@ free_port() {
         warn "Freeing $1..."
         echo "$pids" | xargs kill -9 2>/dev/null || true
         sleep 1
+    fi
+}
+
+# Compute MD5 hash of a file (works on macOS and Linux)
+file_hash() {
+    if is_mac; then
+        md5 -q "$1" 2>/dev/null
+    else
+        md5sum "$1" 2>/dev/null | cut -d' ' -f1
     fi
 }
 
@@ -111,20 +124,45 @@ log "ESP32 found at $PORT"
 
 echo ""
 
-# ---- Step 5: Build + flash if no firmware ----
-if [ ! -f "$PROJECT_DIR/build/split_flap_v11.bin" ]; then
-    echo "--- Building firmware (first time) ---"
-    cd "$PROJECT_DIR"
-    idf.py build 2>&1 | tail -3
-    log "Build complete"
-    echo ""
+# ---- Step 5: Build + check if flash needed ----
+echo "--- Checking firmware ---"
+cd "$PROJECT_DIR"
 
+# Always do incremental build (fast if nothing changed)
+idf.py build 2>&1 | tail -3
+log "Build complete"
+
+# Compute hash of built binary
+if [ ! -f "$BIN_PATH" ]; then
+    fail "Build output not found: $BIN_PATH"
+fi
+CURRENT_HASH=$(file_hash "$BIN_PATH")
+
+# Compare against last flash
+NEEDS_FLASH=true
+if [ -f "$FLASH_MARKER" ]; then
+    LAST_HASH=$(cat "$FLASH_MARKER")
+    if [ "$CURRENT_HASH" = "$LAST_HASH" ]; then
+        NEEDS_FLASH=false
+        log "Firmware up-to-date (already flashed)"
+    else
+        warn "Firmware changed since last flash"
+    fi
+else
+    info "No flash record found (first time or after clean)"
+fi
+
+if [ "$NEEDS_FLASH" = true ]; then
+    echo ""
     echo "--- Flashing to $PORT ---"
     free_port "$PORT"
     idf.py flash -p "$PORT" 2>&1 | tail -5
+    # Save hash after successful flash
+    echo "$CURRENT_HASH" > "$FLASH_MARKER"
     log "Flash complete"
-    echo ""
 fi
+
+echo ""
 
 # ---- Step 6: Open serial monitor ----
 echo "--- Opening serial monitor ---"
