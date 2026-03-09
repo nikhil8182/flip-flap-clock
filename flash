@@ -1,7 +1,7 @@
-#\!/bin/zsh
+#\!/bin/bash
 #
 # Split-Flap Clock - Build & Flash
-# Detects ESP32, builds firmware, flashes it
+# Works on macOS, Linux, and WSL
 #
 
 set -e
@@ -15,31 +15,44 @@ GRN="\033[0;32m"
 YEL="\033[0;33m"
 NC="\033[0m"
 
-log()  { echo "${GRN}[OK]${NC} $1" }
-warn() { echo "${YEL}[\!\!]${NC} $1" }
-fail() { echo "${RED}[ERR]${NC} $1"; exit 1 }
+log()  { echo -e "${GRN}[OK]${NC} $1"; }
+warn() { echo -e "${YEL}[\!\!]${NC} $1"; }
+fail() { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
 
 find_port() {
-    for port in /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem-*; do
-        [ -e "$port" ] && echo "$port" && return 0
-    done
-    for port in /dev/ttyUSB* /dev/ttyACM*; do
-        [ -e "$port" ] && echo "$port" && return 0
+    local patterns=(
+        /dev/cu.usbserial-*
+        /dev/cu.wchusbserial-*
+        /dev/cu.SLAB_USBtoUART*
+        /dev/cu.usbmodem-*
+        /dev/ttyUSB*
+        /dev/ttyACM*
+    )
+    for pattern in "${patterns[@]}"; do
+        for port in $pattern; do
+            [ -e "$port" ] && echo "$port" && return 0
+        done
     done
     return 1
 }
 
 free_port() {
-    local pids=$(lsof -t "$1" 2>/dev/null)
-    [ -n "$pids" ] && warn "Freeing $1..." && echo "$pids" | xargs kill -9 2>/dev/null && sleep 1
+    local pids
+    pids=$(lsof -t "$1" 2>/dev/null || fuser "$1" 2>/dev/null | tr -s \" \" \"\n\" || true)
+    if [ -n "$pids" ]; then
+        warn "Freeing $1..."
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
 }
 
 # ---- Check ESP-IDF ----
 if [ \! -f "$IDF_PATH/export.sh" ]; then
-    fail "ESP-IDF not found. Run ./start first to install."
+    fail "ESP-IDF not found. Run ./start first to install everything."
 fi
 
-source "$IDF_PATH/export.sh" 2>/dev/null
+export IDF_PATH
+source "$IDF_PATH/export.sh" 2>/dev/null || true
 cd "$PROJECT_DIR"
 
 # ---- Build ----
@@ -49,7 +62,7 @@ idf.py build 2>&1 | tail -5
 log "Build complete"
 
 # ---- Flash ----
-PORT=$(find_port)
+PORT=$(find_port || true)
 if [ -z "$PORT" ]; then
     warn "No ESP32 detected. Build OK, flash skipped."
     echo "  Plug in ESP32 and run ./flash again."

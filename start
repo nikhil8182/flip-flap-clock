@@ -1,7 +1,8 @@
-#\!/bin/zsh
+#!/bin/bash
 #
 # Split-Flap Clock - First Time Setup + Serial Monitor
-# Clone the repo, plug in ESP32, run ./start
+# Works on macOS, Linux, and WSL
+# Usage: ./start
 #
 
 set -e
@@ -11,31 +12,39 @@ IDF_PATH="$HOME/esp/esp-idf-$IDF_VERSION"
 BAUD=115200
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ---- Colors ----
-RED="\033[0;31m"
-GRN="\033[0;32m"
-YEL="\033[0;33m"
-NC="\033[0m"
+log()  { printf '\033[32m[OK]\033[0m %s\n' "$1"; }
+warn() { printf '\033[33m[!!]\033[0m %s\n' "$1"; }
+fail() { printf '\033[31m[ERR]\033[0m %s\n' "$1"; exit 1; }
 
-log()  { echo "${GRN}[OK]${NC} $1" }
-warn() { echo "${YEL}[\!\!]${NC} $1" }
-fail() { echo "${RED}[ERR]${NC} $1"; exit 1 }
+is_mac() { [ "$(uname)" = "Darwin" ]; }
 
-# ---- Find ESP32 serial port ----
+install_pkg() {
+    if is_mac; then
+        command -v brew >/dev/null 2>&1 || fail "Homebrew not found. Install from https://brew.sh"
+        brew install "$1"
+    else
+        sudo apt-get install -y "$1" 2>/dev/null || sudo pacman -S --noconfirm "$1" 2>/dev/null || fail "Cannot install $1"
+    fi
+}
+
 find_port() {
-    for port in /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem-*; do
-        [ -e "$port" ] && echo "$port" && return 0
-    done
-    # Linux
-    for port in /dev/ttyUSB* /dev/ttyACM*; do
+    for port in /dev/cu.usbserial-* /dev/cu.wchusbserial-* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem-* /dev/ttyUSB* /dev/ttyACM*; do
         [ -e "$port" ] && echo "$port" && return 0
     done
     return 1
 }
 
 free_port() {
-    local pids=$(lsof -t "$1" 2>/dev/null)
-    [ -n "$pids" ] && warn "Freeing $1..." && echo "$pids" | xargs kill -9 2>/dev/null && sleep 1
+    local pids
+    pids=$(lsof -t "$1" 2>/dev/null || true)
+    if [ -z "$pids" ]; then
+        pids=$(fuser "$1" 2>/dev/null | tr -s ' ' '\n' || true)
+    fi
+    if [ -n "$pids" ]; then
+        warn "Freeing $1..."
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
 }
 
 echo ""
@@ -47,21 +56,24 @@ echo ""
 # ---- Step 1: Check dependencies ----
 echo "--- Checking dependencies ---"
 
-# git
-command -v git &>/dev/null || fail "git not found. Install: brew install git"
+command -v git >/dev/null 2>&1 || { warn "git not found, installing..."; install_pkg git; }
 log "git"
 
-# python3
-command -v python3 &>/dev/null || fail "python3 not found. Install: brew install python3"
+command -v python3 >/dev/null 2>&1 || { warn "python3 not found, installing..."; install_pkg python3; }
 log "python3"
 
-# cmake
-command -v cmake &>/dev/null || { warn "cmake not found, installing..."; brew install cmake; }
+command -v cmake >/dev/null 2>&1 || { warn "cmake not found, installing..."; install_pkg cmake; }
 log "cmake"
 
-# screen
-command -v screen &>/dev/null || { warn "screen not found, installing..."; brew install screen; }
+command -v screen >/dev/null 2>&1 || { warn "screen not found, installing..."; install_pkg screen; }
 log "screen"
+
+# Linux may need these for ESP-IDF
+if ! is_mac; then
+    for pkg in python3-venv python3-pip; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || sudo apt-get install -y "$pkg" 2>/dev/null || true
+    done
+fi
 
 echo ""
 
@@ -71,7 +83,7 @@ echo "--- Checking ESP-IDF $IDF_VERSION ---"
 if [ -f "$IDF_PATH/export.sh" ]; then
     log "ESP-IDF found at $IDF_PATH"
 else
-    warn "ESP-IDF not found. Installing (this takes a few minutes)..."
+    warn "ESP-IDF not found. Installing (takes 3-5 minutes)..."
     mkdir -p "$HOME/esp"
     cd "$HOME/esp"
     git clone -b "$IDF_VERSION" --recursive https://github.com/espressif/esp-idf.git "esp-idf-$IDF_VERSION"
@@ -82,24 +94,26 @@ fi
 
 echo ""
 
-# ---- Step 3: Check ESP32 connected ----
+# ---- Step 3: Source IDF ----
+export IDF_PATH
+. "$IDF_PATH/export.sh" 2>/dev/null || true
+
+# ---- Step 4: Check ESP32 connected ----
 echo "--- Checking ESP32 ---"
 
-PORT=$(find_port)
+PORT=$(find_port || true)
 if [ -z "$PORT" ]; then
     warn "No ESP32 detected."
-    echo "  Plug in your ESP32 and run ./start again."
-    echo "  Searched: /dev/cu.usbserial-* /dev/ttyUSB*"
+    echo "  Plug in your ESP32 via USB and run ./start again."
     exit 0
 fi
 log "ESP32 found at $PORT"
 
 echo ""
 
-# ---- Step 4: Build if no firmware yet ----
-if [ \! -f "$PROJECT_DIR/build/split_flap_v11.bin" ]; then
+# ---- Step 5: Build + flash if no firmware ----
+if [ ! -f "$PROJECT_DIR/build/split_flap_v11.bin" ]; then
     echo "--- Building firmware (first time) ---"
-    source "$IDF_PATH/export.sh" 2>/dev/null
     cd "$PROJECT_DIR"
     idf.py build 2>&1 | tail -3
     log "Build complete"
@@ -112,7 +126,7 @@ if [ \! -f "$PROJECT_DIR/build/split_flap_v11.bin" ]; then
     echo ""
 fi
 
-# ---- Step 5: Open serial monitor ----
+# ---- Step 6: Open serial monitor ----
 echo "--- Opening serial monitor ---"
 echo "  Port: $PORT"
 echo "  Baud: $BAUD"

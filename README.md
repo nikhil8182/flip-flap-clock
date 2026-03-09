@@ -116,63 +116,85 @@ Each drum has **10 flaps** (digits 0-9) and **10 magnets** (one per digit). A Ha
 
 ## Getting Started
 
-### macOS / Linux
+### macOS
+
+Open Terminal and paste these 4 lines:
 
 ```bash
-# 1. Clone the repository
-git clone <repo-url> "flip-flap-clock"
-cd "flip-flap-clock"
-
-# 2. Plug in your ESP32 via USB
-
-# 3. Run start (installs everything automatically)
+git clone https://github.com/nikhil8182/flip-flap-clock.git
+cd flip-flap-clock
+chmod +x start flash dev.sh open.sh
 ./start
 ```
 
-That's it! `./start` will:
-- Install ESP-IDF v5.4.1 (if not already installed, ~5 minutes first time)
-- Check all dependencies (git, python3, cmake, screen)
-- Detect your ESP32 automatically
-- Build and flash the firmware (first time)
-- Open the serial monitor
+### Linux (Ubuntu/Debian)
+
+Open Terminal and paste:
+
+```bash
+sudo apt update && sudo apt install -y git python3 python3-venv cmake screen
+git clone https://github.com/nikhil8182/flip-flap-clock.git
+cd flip-flap-clock
+chmod +x start flash dev.sh open.sh
+./start
+```
 
 ### Windows
 
-Windows does not run the shell scripts directly. Use one of these options:
-
 **Option A: WSL (Recommended)**
-```powershell
-# 1. Install WSL (run PowerShell as Administrator)
-wsl --install
 
-# 2. Open WSL terminal (Ubuntu) and follow macOS/Linux steps above
-git clone <repo-url> "flip-flap-clock"
-cd "flip-flap-clock"
+1. Open PowerShell **as Administrator** and run:
+```powershell
+wsl --install
+```
+2. Restart your computer
+3. Open **Ubuntu** from Start Menu and paste:
+```bash
+sudo apt update && sudo apt install -y git python3 python3-venv cmake screen
+git clone https://github.com/nikhil8182/flip-flap-clock.git
+cd flip-flap-clock
+chmod +x start flash dev.sh open.sh
 ./start
 ```
 
-**Option B: ESP-IDF Windows Installer**
-1. Download ESP-IDF Tools Installer from https://dl.espressif.com/dl/esp-idf/
-2. Install ESP-IDF v5.4.1 with the installer
-3. Open "ESP-IDF Command Prompt" from Start Menu
-4. Navigate to the project folder:
+**Option B: ESP-IDF Windows Installer (no WSL)**
+
+1. Download and install from: https://dl.espressif.com/dl/esp-idf/
+2. Pick version **5.4.1** during install
+3. Open **ESP-IDF Command Prompt** from Start Menu
+4. Run:
 ```cmd
-cd "C:\path\to\flip-flap-clock"
+git clone https://github.com/nikhil8182/flip-flap-clock.git
+cd flip-flap-clock
 idf.py build
 idf.py flash
 idf.py monitor
 ```
 
-### After Setup
+### What `./start` Does
 
-Once flashed, open the serial monitor:
-```bash
-./start              # macOS/Linux: opens serial monitor
-# or
-idf.py monitor       # any platform (from ESP-IDF command prompt)
+You don't need to install anything manually. The start script handles everything:
+
+1. Checks dependencies (git, python3, cmake, screen) -- installs if missing
+2. Downloads and installs ESP-IDF v5.4.1 (~5 min, first time only)
+3. Detects your ESP32 USB port automatically
+4. Builds the firmware
+5. Flashes it to the ESP32
+6. Opens the serial monitor
+
+### First Boot
+
+After flashing, the serial monitor will show:
+
+```
++-----------------------------------+
+|  What number is showing now?      |
+|  Type 4 digits + Enter            |
++-----------------------------------+
+>
 ```
 
-The display will ask what number is currently showing. Type the 4 digits you see and press Enter. After that, you're ready to send commands.
+Look at the physical flaps and type what you see (e.g., `0000`). Press Enter. Now you can send commands.
 
 ---
 
