@@ -56,12 +56,12 @@ static int SPF[N_DIGITS] = {
 };
 
 /* Step delays (microseconds) */
-static uint32_t RUN_US[N_DIGITS] = { 2000, 2000, 2000, 2000 };
-static uint32_t CAL_US[N_DIGITS] = { 3000, 3000, 3000, 3000 };
+static uint32_t RUN_US[N_DIGITS] = { 1000, 1000, 1000, 1000 };
+static uint32_t CAL_US[N_DIGITS] = { 2000, 2000, 2000, 2000 };
 
 /* Ramp profile */
-#define RAMP_STEPS      80
-#define RAMP_START_US   5000
+#define RAMP_STEPS      40
+#define RAMP_START_US   3000
 
 /*
  * MIN_IDLE: minimum consecutive idle reads before a rising edge
@@ -326,12 +326,34 @@ static void display_digits(const int digits[N_DIGITS])
     for (int d = 0; d < N_DIGITS; d++) ESP_LOGI(TAG, " %d", cur[d]);
     ESP_LOGI(TAG, "]");
 
+    /* Calculate steps needed for each motor */
+    int total[N_DIGITS];
+    int max_steps = 0;
     for (int d = 0; d < N_DIGITS; d++) {
-        move_to(d, digits[d]);
-        vTaskDelay(pdMS_TO_TICKS(COOLDOWN_MS));
+        if (!calibrated[d]) {
+            ESP_LOGW(TAG, "[D%d] Not calibrated — calibrating", d);
+            calibrate_drum(d);
+        }
+        int flaps = (digits[d] - cur[d] + N_FLAPS) % N_FLAPS;
+        total[d] = flaps * SPF[d];
+        if (total[d] > max_steps) max_steps = total[d];
+        if (flaps > 0)
+            ESP_LOGI(TAG, "[D%d] %d -> %d (%d flaps, %d steps)",
+                     d, cur[d], digits[d], flaps, total[d]);
+    }
+
+    /* Step all motors simultaneously */
+    for (int s = 0; s < max_steps; s++) {
+        for (int d = 0; d < N_DIGITS; d++) {
+            if (s < total[d])
+                motor_step(d, ramp_speed(s, total[d], RUN_US[d]));
+        }
+        if (s % 200 == 0 && s > 0) vTaskDelay(1);
     }
 
     motor_off_all();
+    for (int d = 0; d < N_DIGITS; d++)
+        cur[d] = digits[d];
     nvs_save();
 
     ESP_LOGI(TAG, ">>> Display done");
@@ -425,54 +447,132 @@ static void input_task(void *pv)
 
     vTaskDelay(pdMS_TO_TICKS(500));  /* let boot logs flush */
 
-    /* ---- Initial setup: load from NVS or ask user ---- */
-    if (nvs_load()) {
-        for (int d = 0; d < N_DIGITS; d++)
+    /* ---- Initial setup: load SPF from NVS, always ask current position ---- */
+    nvs_load();  /* restore SPF values only */
+
+    printf("\r\n+-----------------------------------+\r\n");
+    printf("|  What number is showing now?      |\r\n");
+    printf("|  Type %d digits + Enter            |\r\n", N_DIGITS);
+    printf("+-----------------------------------+\r\n> ");
+    fflush(stdout);
+
+    char ibuf[16];
+    int ipos = 0;
+    while (ipos < (int)sizeof(ibuf) - 1) {
+        uint8_t ch;
+        if (uart_read_bytes(UART_NUM_0, &ch, 1, portMAX_DELAY) <= 0)
+            continue;
+        if (ch == '\n' || ch == '\r') {
+            uart_write_bytes(UART_NUM_0, "\r\n", 2);
+            break;
+        }
+        if (ch == 127 || ch == '\b') {
+            if (ipos > 0) { ipos--; uart_write_bytes(UART_NUM_0, "\b \b", 3); }
+            continue;
+        }
+        if (ch >= '0' && ch <= '9') {
+            uart_write_bytes(UART_NUM_0, (char *)&ch, 1);
+            ibuf[ipos++] = (char)ch;
+        }
+    }
+    ibuf[ipos] = '\0';
+
+    if (ipos == N_DIGITS) {
+        for (int d = 0; d < N_DIGITS; d++) {
+            cur[d] = ibuf[d] - '0';
             calibrated[d] = true;
-        printf("\r\nLoaded position: [");
+        }
+        printf("Current = [");
         for (int d = 0; d < N_DIGITS; d++) printf(" %d", cur[d]);
         printf(" ]  SPF: [");
         for (int d = 0; d < N_DIGITS; d++) printf(" %d", SPF[d]);
-        printf(" ]\r\nReady!\r\n");
-    } else {
-        printf("\r\n+-----------------------------------+\r\n");
-        printf("|  What number is showing now?      |\r\n");
-        printf("|  Type %d digits + Enter            |\r\n", N_DIGITS);
-        printf("+-----------------------------------+\r\n> ");
-        fflush(stdout);
+        printf(" ]\r\n");
 
-        char ibuf[16];
-        int ipos = 0;
-        while (ipos < (int)sizeof(ibuf) - 1) {
-            uint8_t ch;
-            if (uart_read_bytes(UART_NUM_0, &ch, 1, portMAX_DELAY) <= 0)
-                continue;
-            if (ch == '\n' || ch == '\r') {
-                uart_write_bytes(UART_NUM_0, "\r\n", 2);
-                break;
-            }
-            if (ch == 127 || ch == '\b') {
-                if (ipos > 0) { ipos--; uart_write_bytes(UART_NUM_0, "\b \b", 3); }
-                continue;
-            }
-            if (ch >= '0' && ch <= '9') {
-                uart_write_bytes(UART_NUM_0, (char *)&ch, 1);
-                ibuf[ipos++] = (char)ch;
-            }
-        }
-        ibuf[ipos] = '\0';
+        /* Auto-move to 0000 */
+        bool need_move = false;
+        for (int d = 0; d < N_DIGITS; d++)
+            if (cur[d] != 0) { need_move = true; break; }
 
-        if (ipos == N_DIGITS) {
-            for (int d = 0; d < N_DIGITS; d++) {
-                cur[d] = ibuf[d] - '0';
-                calibrated[d] = true;
+        if (need_move) {
+            int before[N_DIGITS];
+            for (int d = 0; d < N_DIGITS; d++) before[d] = cur[d];
+
+            printf("Moving to 0000...\r\n");
+            cmd_t cmd = { .recal = false };
+            for (int d = 0; d < N_DIGITS; d++) cmd.digits[d] = 0;
+            xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+            while (motor_busy)
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+            /* Verify after move to zero */
+            printf("\r\nShowing? (Enter to skip): ");
+            fflush(stdout);
+            char vbuf[16];
+            int vpos = 0;
+            while (vpos < (int)sizeof(vbuf) - 1) {
+                uint8_t vch;
+                if (uart_read_bytes(UART_NUM_0, &vch, 1, portMAX_DELAY) <= 0)
+                    continue;
+                if (vch == '\n' || vch == '\r') {
+                    uart_write_bytes(UART_NUM_0, "\r\n", 2);
+                    break;
+                }
+                if (vch == 127 || vch == '\b') {
+                    if (vpos > 0) { vpos--; uart_write_bytes(UART_NUM_0, "\b \b", 3); }
+                    continue;
+                }
+                if (vch >= '0' && vch <= '9') {
+                    uart_write_bytes(UART_NUM_0, (char *)&vch, 1);
+                    vbuf[vpos++] = (char)vch;
+                }
             }
-            nvs_save();
-            printf("Set current = [");
-            for (int d = 0; d < N_DIGITS; d++) printf(" %d", cur[d]);
-            printf(" ]\r\nReady!\r\n");
+            vbuf[vpos] = '\0';
+
+            if (vpos == N_DIGITS) {
+                bool perfect = true;
+                for (int d = 0; d < N_DIGITS; d++) {
+                    int actual = vbuf[d] - '0';
+                    if (actual == 0) {
+                        printf("  D%d: OK\r\n", d);
+                        continue;
+                    }
+                    perfect = false;
+                    int flaps_intended = (0 - before[d] + N_FLAPS) % N_FLAPS;
+                    int off = (actual - 0 + N_FLAPS) % N_FLAPS;
+                    if (off > N_FLAPS / 2) off -= N_FLAPS;
+                    int flaps_actual = flaps_intended + off;
+                    printf("  D%d: wanted 0 got %d (off %+d, moved %d/%d flaps)",
+                           d, actual, off, flaps_actual, flaps_intended);
+                    if (flaps_intended >= 2 && flaps_actual >= 2) {
+                        int old_spf = SPF[d];
+                        int new_spf = (flaps_intended * old_spf) / flaps_actual;
+                        if (new_spf < 150) new_spf = 150;
+                        if (new_spf > 400) new_spf = 400;
+                        if (new_spf != old_spf) {
+                            SPF[d] = new_spf;
+                            printf(" -> SPF %d=>%d", old_spf, new_spf);
+                        }
+                    }
+                    printf("\r\n");
+                    cur[d] = actual;
+                }
+                if (perfect) {
+                    printf("  PERFECT! Ready!\r\n");
+                } else {
+                    nvs_save();
+                    printf("  SPF updated & saved.\r\n");
+                }
+            } else {
+                printf("Reset to 0000. Ready!\r\n");
+            }
         } else {
-            printf("Skipped (expected %d digits, got %d)\r\n", N_DIGITS, ipos);
+            printf("Already at 0000. Ready!\r\n");
+        }
+    } else {
+        printf("Skipped (expected %d digits, got %d). Assuming 0000.\r\n", N_DIGITS, ipos);
+        for (int d = 0; d < N_DIGITS; d++) {
+            cur[d] = 0;
+            calibrated[d] = true;
         }
     }
 
@@ -490,7 +590,8 @@ static void input_task(void *pv)
         printf("| spf0 210 = set SPF        |\r\n");
         printf("| speed 1500 = set speed    |\r\n");
         printf("| s0 200 = raw steps        |\r\n");
-        printf("| all 4000 = all motors     |\r\n");
+        printf("| all = all motors at once  |\r\n");
+        printf("| obo = one by one          |\r\n");
         printf("| cal / st                  |\r\n");
         printf("+---------------------------+\r\n> ");
         fflush(stdout);
@@ -543,16 +644,35 @@ static void input_task(void *pv)
             continue;
         }
 
-        /* 'all 4000' = step all motors by 4000 steps */
+        /* 'all' = full rotation on ALL motors simultaneously */
         if (strncasecmp(buf, "all", 3) == 0) {
-            int steps = atoi(buf + 3);
-            if (steps <= 0) steps = 1;
-            if (steps > 10000) steps = 10000;
-            printf("All motors: %d steps...\r\n", steps);
-            cmd_t cmd = { .all_step = true, .step_count = steps };
+            int max_steps = 0;
+            for (int d = 0; d < N_DIGITS; d++) {
+                int s = N_FLAPS * SPF[d];
+                if (s > max_steps) max_steps = s;
+            }
+            printf("All motors: full rotation (%d steps)...\r\n", max_steps);
+            cmd_t cmd = { .all_step = true, .step_count = max_steps };
             xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
             while (motor_busy)
                 vTaskDelay(pdMS_TO_TICKS(100));
+            printf("All done!\r\n");
+            continue;
+        }
+
+        /* 'obo' = full rotation on each motor, one by one */
+        if (strncasecmp(buf, "obo", 3) == 0) {
+            printf("One by one: full rotation each motor...\r\n");
+            for (int d = 0; d < N_DIGITS; d++) {
+                int steps = N_FLAPS * SPF[d];
+                printf("  M%d: %d flaps, %d steps...\r\n", d, N_FLAPS, steps);
+                cmd_t cmd = { .manual_step = true, .step_motor = d, .step_count = steps };
+                xQueueSend(cmd_queue, &cmd, portMAX_DELAY);
+                while (motor_busy)
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                vTaskDelay(pdMS_TO_TICKS(COOLDOWN_MS));
+            }
+            printf("All done!\r\n");
             continue;
         }
 
